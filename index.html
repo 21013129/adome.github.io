@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Vectrex‑stílusú neon‑zöld Tesseract</title>
+  <style>
+    :root{
+      --green: #39ff14;          /* Vectrex‑szerű neonzöld */
+      --bg: #000;                /* mélyfekete háttér */
+      --trail: 0.09;             /* foszfor‑utánhúzás erőssége (0..1, nagyobb = hosszabb csóva) */
+      --scanline-alpha: .12;     /* statikus CRT scanline erősség */
+      --barrel: 0.085;           /* geometriai hordó‑torzítás erőssége (≈0.05..0.15 javasolt) */
+      --wobble: 1.33;             /* „beam wobble” amplitúdó px‑ben (0..2) */
+      --keystone-x: 0.06;        /* vízszintes keystone (x szorzása a y függvényében) */
+      --keystone-y: -0.02;       /* függőleges keystone (y szorzása az x függvényében) */
+      --bloom1: 1.6;             /* px – első bloom sugár */
+      --bloom2: 4.0;             /* px – második bloom sugár */
+      --bloom3: 8.0;             /* px – harmadik bloom sugár */
+      --bloomA1: .55;            /* alfa – első bloom */
+      --bloomA2: .35;            /* alfa – második bloom */
+      --bloomA3: .20;            /* alfa – harmadik bloom */
+      --defocus: 0.5;            /* px – alap lencse‑defókusz (0..1.5 javasolt) */
+      /* Színes foszfor‑szellemkép (utóképcsík) */
+      --ghost1: .35;             /* első ghost alfája */
+      --ghost2: .18;             /* második ghost alfája */
+      --ghostSpread1: 0.60;      /* eltolás a sebesség vektor mentén (szorzó) */
+      --ghostSpread2: 1.20;      /* nagyobb eltolás */
+      --ghostColor1: #32ffe0;    /* ciános árnyalat */
+      --ghostColor2: #ff6cff;    /* magentás árnyalat */
+      /* Irányfüggő foszfor "smear" (kontinuus elkenés a mozgás irányába) */
+      --smearTaps: 7;            /* hány lerakott másolat */
+      --smearAlpha: .085;        /* alap alfa egy csapásra */
+      --smearDecay: .82;         /* csökkenési ráta tap-onként (0..1) */
+      --smearScale: 1.0;         /* skálázó a becsült sebességvektorra */
+      --smearBlur: 1.2;          /* px – enyhe elmosás a csíkokra */
+      /* Zaj-maszkolt fényerő hullámzás (scanline‑szintű jitter) */
+      --scanRippleAmp: .08;      /* amplitúdó (0..0.3 körül) */
+      --scanRippleAlpha: .08;    /* átlag alfa a ripple overlayhez */
+      --scanRippleSpeed: 18;     /* sebesség (rad/s) – mennyire "rezeg" */
+      --scanStride: 2;           /* px – hányadik soronként rajzoljon csíkot */
+      --scanNoise: .35;          /* zaj súly (0..1) */
+      /* Analog focus breathing (lassú fókusz pumpa) */
+      --focusBreathAmp: .45;     /* px – extra blur amplitúdó */
+      --focusBreathHz: .07;      /* Hz – légzés frekvencia (0.03..0.15) */
+    }
+    *{ box-sizing: border-box }
+    html, body{ height:100% }
+    body{
+      margin:0;
+      height:100%;
+      width:100%;
+      background: var(--bg);
+      overflow:hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Noto Sans", "Helvetica Neue", Arial;
+    }
+    canvas#vectrex{
+      display:block;
+      width:100vw; height:100vh; /* teljes ablak */
+      background: var(--bg);
+      image-rendering: optimizeSpeed;
+      cursor: default; /* nem-interaktív jelleg */
+    }
+
+    /* CRT overlayk */
+    .overlay{ position:fixed; inset:0; pointer-events:none; }
+    .scanlines{
+      background:
+        repeating-linear-gradient(
+          to bottom,
+          rgba(255,255,255,var(--scanline-alpha)) 0px,
+          rgba(255,255,255,var(--scanline-alpha)) 1px,
+          rgba(0,0,0,0) 2px,
+          rgba(0,0,0,0) 4px
+        );
+      mix-blend-mode: overlay;
+    }
+    .vignette{
+      background: radial-gradient(120% 80% at 50% 50%, rgba(0,0,0,0) 60%, rgba(0,0,0,.65) 100%);
+      mix-blend-mode: multiply;
+    }
+    .credit{
+      position:fixed; left:50%; bottom:.6rem; transform:translateX(-50%);
+      color:#9ee69f; opacity:.35; font-size:.75rem; letter-spacing:.02em;
+      user-select:none; pointer-events:none;
+      text-shadow: 0 0 8px color-mix(in oklab, var(--green) 60%, transparent);
+    }
+
+    @media (prefers-reduced-motion: reduce){
+      .scanlines{ animation: none; }
+    }
+  </style>
+</head>
+<body>
+  <canvas id="vectrex" aria-label="Neonzöld, Vectrex stílusú drótváz Tesseract (hiperkocka), teljes CRT torzításokkal, színes foszfor‑szellemképpel, irányfüggő smearrel, zajos scanline‑jitterrel és fókusz‑breathinggel."></canvas>
+  <div class="overlay scanlines"></div>
+  <div class="overlay vignette"></div>
+  <div class="credit">Vectrex‑stílusú Tesseract • HTML5 Canvas • Teljes CRT FX + ripple + breathing</div>
+
+  <script>
+  (()=>{
+    const canvas = document.getElementById('vectrex');
+    const ctx = canvas.getContext('2d', { alpha:false });
+
+    // Offscreen buffer a post‑processinghez (ghost/bloom/defocus/smear)
+    const frame = document.createElement('canvas');
+    const fctx  = frame.getContext('2d');
+
+    function cssNum(name, fallback){
+      const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
+      return Number.isFinite(v) ? v : fallback;
+    }
+    function cssStr(name, fallback){
+      const v = getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+      return v || fallback;
+    }
+
+    function resize(){
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const w = Math.floor(innerWidth);
+      const h = Math.floor(innerHeight);
+
+      // Főkép
+      canvas.width  = w * dpr;
+      canvas.height = h * dpr;
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.scale(dpr, dpr);
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0,0,w,h);
+
+      // Offscreen buffer (CSS px koordinátákon rajzolunk)
+      frame.width  = w;
+      frame.height = h;
+      fctx.setTransform(1,0,0,1,0,0);
+      fctx.clearRect(0,0,w,h);
+    }
+    addEventListener('resize', resize, { passive:true });
+    resize();
+
+    // ===== 4D GEOMETRIA: TESSERACT =====
+    const V4 = [];
+    for(let i=0;i<16;i++){
+      const x = (i & 1) ?  1 : -1;
+      const y = (i & 2) ?  1 : -1;
+      const z = (i & 4) ?  1 : -1;
+      const w = (i & 8) ?  1 : -1;
+      V4.push([x,y,z,w]);
+    }
+    const E = [];
+    for(let v=0; v<16; v++){
+      for(let d=0; d<4; d++){
+        const u = v ^ (1<<d);
+        if(v < u) E.push([v,u]);
+      }
+    }
+
+    // ===== 4D forgatás – síkforgatások (XY, XZ, XW, YZ, YW, ZW) =====
+    const speedXY = 0.7,
+          speedXZ = 0.9,
+          speedXW = 0.6,
+          speedYZ = 1.1,
+          speedYW = 0.8,
+          speedZW = 1.3;
+
+    function rot2(a, b, ang){
+      const c=Math.cos(ang), s=Math.sin(ang);
+      return [a*c - b*s, a*s + b*c];
+    }
+
+    function rotate4([x,y,z,w], t){
+      let X=x, Y=y, Z=z, W=w;
+      [X, Y] = rot2(X, Y, t*speedXY);
+      [X, Z] = rot2(X, Z, t*speedXZ);
+      [X, W] = rot2(X, W, t*speedXW);
+      [Y, Z] = rot2(Y, Z, t*speedYZ);
+      [Y, W] = rot2(Y, W, t*speedYW);
+      [Z, W] = rot2(Z, W, t*speedZW);
+      return [X,Y,Z,W];
+    }
+
+    function project4to3([x,y,z,w]){
+      const d4 = 3.2;               // 4D „kamera” távolság W irányban
+      const f  = d4 / (d4 - w);     // near‑safe, w∈[−1,1]
+      return [x*f, y*f, z*f];
+    }
+
+    function project3([x,y,z]){
+      const w = innerWidth, h = innerHeight;
+      const d3 = 3.2;                // kamera távolság Z irányban
+      const zc = z + d3;
+      const scale = Math.min(w, h) * 0.9 * 0.5;
+      const px = x / zc * scale + w/2;
+      const py = y / zc * scale + h/2;
+      return [px, py];
+    }
+
+    function barrel([x,y]){
+      const w = innerWidth, h = innerHeight;
+      const cx = w/2, cy = h/2;
+      const dx = x - cx, dy = y - cy;
+      const r2 = dx*dx + dy*dy;
+      const s2 = Math.pow(Math.min(w,h)*0.5, 2);
+      const k = cssNum('--barrel', 0.085);
+      const f = 1 + k * (r2 / s2);
+      return [cx + dx * f, cy + dy * f];
+    }
+
+    function keystone([x,y]){
+      const w = innerWidth, h = innerHeight;
+      const cx = w/2, cy = h/2;
+      const nx = (x - cx) / (w/2);
+      const ny = (y - cy) / (h/2);
+      const kx = cssNum('--keystone-x', 0.0);
+      const ky = cssNum('--keystone-y', 0.0);
+      const sx = 1 + kx * ny;
+      const sy = 1 + ky * nx;
+      return [cx + nx * (w/2) * sx, cy + ny * (h/2) * sy];
+    }
+
+    function jitter([x,y], t){
+      const amp = 0.6; // px
+      const n1 = Math.sin(x*12.9898 + y*78.233 + t*120.0) * 43758.5453;
+      const n2 = Math.sin(x*93.9898 + y*67.345 + t*100.0) * 24634.6345;
+      return [x + (n1 - Math.floor(n1) - .5)*amp, y + (n2 - Math.floor(n2) - .5)*amp];
+    }
+
+    function wobble([x,y], t){
+      const A = cssNum('--wobble', 0.8);
+      const w = 2*Math.PI*50*t;                 // 50 Hz hálózati hullám
+      const lfo = 0.85 + 0.15*Math.sin(2*Math.PI*0.6*t); // lassú amplitúdó moduláció
+      const dx = A * lfo * Math.sin(w + y*0.03);
+      const dy = (A*0.45) * lfo * Math.cos(w*0.97 + x*0.02);
+      return [x+dx, y+dy];
+    }
+
+    let startTime = null;
+    let prevPolylines = null;
+
+    function computePolylines(t){
+      const SEG = 16;
+      const result = [];
+      for(const [a,b] of E){
+        const A = V4[a], B = V4[b];
+        const pts = [];
+        for(let i=0;i<=SEG;i++){
+          const u = i/SEG;
+          const p4 = [
+            A[0] + (B[0]-A[0])*u,
+            A[1] + (B[1]-A[1])*u,
+            A[2] + (B[2]-A[2])*u,
+            A[3] + (B[3]-A[3])*u,
+          ];
+          const r4 = rotate4(p4, t);
+          const p3 = project4to3(r4);
+          let p2 = project3(p3);
+          p2 = barrel(p2);
+          p2 = keystone(p2);
+          p2 = wobble(p2, t);
+          pts.push(p2);
+        }
+        result.push(pts);
+      }
+      return result;
+    }
+
+    function meanVelocity(prevLines, curLines){
+      if(!prevLines) return [0,0];
+      let sx=0, sy=0, n=0;
+      for(let e=0; e<curLines.length; e++){
+        const cur = curLines[e];
+        const prv = prevLines[e];
+        if(!prv) continue;
+        const m = Math.min(cur.length, prv.length);
+        for(let i=0;i<m;i++){
+          sx += cur[i][0] - prv[i][0];
+          sy += cur[i][1] - prv[i][1];
+          n++;
+        }
+      }
+      if(n===0) return [0,0];
+      return [sx/n, sy/n];
+    }
+
+    function drawGhosts(targetCtx, prevLines, curLines, flicker){
+      if(!prevLines) return;
+      const a1 = cssNum('--ghost1', .35), a2 = cssNum('--ghost2', .18);
+      const s1 = cssNum('--ghostSpread1', 0.6), s2 = cssNum('--ghostSpread2', 1.2);
+      const c1 = cssStr('--ghostColor1', '#32ffe0');
+      const c2 = cssStr('--ghostColor2', '#ff6cff');
+
+      targetCtx.save();
+      targetCtx.globalCompositeOperation = 'lighter';
+      targetCtx.lineCap = 'round';
+      targetCtx.lineJoin = 'round';
+
+      function pass(alpha, spread, color, width){
+        if(alpha<=0 || spread<=0) return;
+        targetCtx.strokeStyle = color;
+        targetCtx.globalAlpha = alpha * flicker;
+        targetCtx.lineWidth = width;
+        targetCtx.beginPath();
+        for(let e=0; e<curLines.length; e++){
+          const cur = curLines[e];
+          const prv = prevLines[e] || cur;
+          for(let i=0;i<cur.length;i++){
+            const cx = cur[i][0], cy = cur[i][1];
+            const px = prv[i] ? prv[i][0] : cx;
+            const py = prv[i] ? prv[i][1] : cy;
+            const vx = cx - px, vy = cy - py;
+            const gx = cx - vx * spread;
+            const gy = cy - vy * spread;
+            if(i===0) targetCtx.moveTo(gx,gy); else targetCtx.lineTo(gx,gy);
+          }
+        }
+        targetCtx.stroke();
+      }
+
+      pass(a1, s1, c1, 2.4);
+      pass(a2, s2, c2, 1.8);
+
+      targetCtx.restore();
+    }
+
+    function drawEdgesFromPolylines(targetCtx, lines, t, flicker){
+      targetCtx.save();
+      targetCtx.globalAlpha = flicker;
+      targetCtx.lineCap = 'round';
+      targetCtx.lineJoin = 'round';
+      targetCtx.shadowColor = 'rgba(57,255,20,0.95)';
+      targetCtx.shadowBlur = 24;
+      targetCtx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--green') || '#39ff14';
+      targetCtx.lineWidth = 3.0;
+      targetCtx.beginPath();
+      for(const pts of lines){
+        for(let i=0;i<pts.length;i++){
+          let [x,y] = pts[i];
+          [x,y] = jitter([x,y], t);
+          if(i===0) targetCtx.moveTo(x,y); else targetCtx.lineTo(x,y);
+        }
+      }
+      targetCtx.stroke();
+
+      targetCtx.shadowBlur = 0;
+      targetCtx.lineWidth = 1.15;
+      targetCtx.strokeStyle = '#b9ffc0';
+      targetCtx.beginPath();
+      for(const pts of lines){
+        for(let i=0;i<pts.length;i++){
+          const [x,y] = pts[i];
+          if(i===0) targetCtx.moveTo(x,y); else targetCtx.lineTo(x,y);
+        }
+      }
+      targetCtx.stroke();
+      targetCtx.restore();
+    }
+
+    function postProcessDraw(avgVx, avgVy, t){
+      const w = innerWidth, h = innerHeight;
+
+      // Irányfüggő foszfor smear
+      const taps = Math.max(0, Math.floor(cssNum('--smearTaps', 0)));
+      const a0   = cssNum('--smearAlpha', .085);
+      const dec  = cssNum('--smearDecay', .82);
+      const scl  = cssNum('--smearScale', 1.0);
+      const sblr = cssNum('--smearBlur', 1.2);
+      const mv2  = avgVx*avgVx + avgVy*avgVy;
+      if(taps>0 && mv2>0.0001){
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        for(let i=1;i<=taps;i++){
+          ctx.globalAlpha = a0 * Math.pow(dec, i-1);
+          if(sblr>0) ctx.filter = `blur(${sblr}px)`; else ctx.filter = 'none';
+          ctx.drawImage(frame, -avgVx * scl * i, -avgVy * scl * i, w, h);
+        }
+        ctx.restore();
+      }
+
+      // Bloom passok – additive komponálás
+      const b1 = cssNum('--bloom1', 0), a1 = cssNum('--bloomA1', 0);
+      const b2 = cssNum('--bloom2', 0), a2 = cssNum('--bloomA2', 0);
+      const b3 = cssNum('--bloom3', 0), a3 = cssNum('--bloomA3', 0);
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+
+      if(b1>0 && a1>0){ ctx.globalAlpha=a1; ctx.filter=`blur(${b1}px)`; ctx.drawImage(frame,0,0,w,h); }
+      if(b2>0 && a2>0){ ctx.globalAlpha=a2; ctx.filter=`blur(${b2}px)`; ctx.drawImage(frame,0,0,w,h); }
+      if(b3>0 && a3>0){ ctx.globalAlpha=a3; ctx.filter=`blur(${b3}px)`; ctx.drawImage(frame,0,0,w,h); }
+
+      ctx.restore();
+
+      // Analog focus breathing – lassú blur pumpa
+      const defocusBase = cssNum('--defocus', 0);
+      const fbAmp = cssNum('--focusBreathAmp', 0);
+      const fbHz  = cssNum('--focusBreathHz', 0.07);
+      const breath = defocusBase + Math.max(0, fbAmp * (0.5 + 0.5*Math.sin(2*Math.PI*fbHz*t)));
+      if(breath>0){
+        ctx.save();
+        ctx.globalAlpha = 0.22; // finom lágyítás
+        ctx.filter = `blur(${breath}px)`;
+        ctx.drawImage(frame,0,0,w,h);
+        ctx.restore();
+      }
+
+      // Végül: éles kép normál módban
+      ctx.drawImage(frame,0,0,w,h);
+
+      // Scanline‑szintű zajos brightness ripple
+      drawScanlineRipple(t);
+
+      // Reset
+      ctx.filter = 'none';
+      ctx.globalCompositeOperation = 'source-over';
+    }
+
+    // Zaj-maszkolt fényerő hullámzás: vékony vízszintes csíkok eltérő alfával
+    function drawScanlineRipple(t){
+      const w = innerWidth, h = innerHeight;
+      const stride = Math.max(1, Math.floor(cssNum('--scanStride', 2)));
+      const amp = cssNum('--scanRippleAmp', .08);
+      const baseA = cssNum('--scanRippleAlpha', .08);
+      const speed = cssNum('--scanRippleSpeed', 18);
+      const nz = cssNum('--scanNoise', .35);
+
+      ctx.save();
+      ctx.globalCompositeOperation = 'overlay';
+      ctx.fillStyle = '#fff';
+
+      for(let y=0; y<h; y+=stride){
+        const phase = y*0.055 + t*speed; // függőleges hullám + idő
+        const s = Math.sin(phase);
+        const n = fract(Math.sin((y+0.5)*12.345 + t*97.77) * 43758.5453) * 2 - 1; // −1..1
+        const v = (1 + amp*( (1-nz)*s + nz*n )) * baseA; // maszkos fényerő
+        if(v<=0.001) continue;
+        ctx.globalAlpha = Math.max(0, Math.min(1, v));
+        ctx.fillRect(0, y, w, 1);
+      }
+
+      ctx.restore();
+    }
+
+    function fract(x){ return x - Math.floor(x); }
+
+    function frameLoop(now){
+      if(startTime===null) startTime = now;
+      const t = (now - startTime) / 1000;
+      const flicker = 0.92 + 0.08 * Math.sin(t * 2*Math.PI * 50);
+
+      // Trail a fővásznon
+      ctx.fillStyle = `rgba(0,0,0,${cssNum('--trail', 0.18)})`;
+      ctx.fillRect(0,0,innerWidth,innerHeight);
+
+      // Aktuális polilineok (tesseract)
+      const curLines = computePolylines(t);
+
+      // Offscreen buffer törlése és ghost rajz
+      fctx.clearRect(0,0,innerWidth,innerHeight);
+      drawGhosts(fctx, prevPolylines, curLines, flicker);
+
+      // Neon él + mag
+      drawEdgesFromPolylines(fctx, curLines, t, flicker);
+
+      // Átlagsebesség a smearhez
+      const [mvx, mvy] = meanVelocity(prevPolylines, curLines);
+
+      // Post‑FX és visszamásolás a fővászonra
+      postProcessDraw(mvx, mvy, t);
+
+      // Eltároljuk a mostani pontokat a következő frame‑hez
+      prevPolylines = curLines;
+
+      if(!matchMedia('(prefers-reduced-motion: reduce)').matches) requestAnimationFrame(frameLoop);
+    }
+
+    requestAnimationFrame(frameLoop);
+  })();
+  </script>
+</body>
+</html>
